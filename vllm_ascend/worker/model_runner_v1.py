@@ -3740,13 +3740,83 @@ class NPUModelRunner(GPUModelRunner):
                                     kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor, dsa_k_tensor)
                             else:
                                 kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor)
+        # Serving-only DeepSeek-V4 fix:
+        # CompressorStateCache is a real AttentionLayerBase with its own
+        # SlidingWindowMLASpec. It is required by the Ascend compressor kernel,
+        # but the Ascend allocation loop above only materializes normal attn
+        # KV tensors. Allocate raw byte buffers for missing compressor state
+        # caches here. Training is unchanged unless DSV4_VLLM_SERVE_PATCH=1.
+        if __import__("os").environ.get("DSV4_VLLM_SERVE_PATCH", "0") == "1":
+            for group in kv_cache_config.kv_cache_groups:
+                for state_name in group.layer_names:
+                    if not state_name.endswith(".compressor.state_cache"):
+                        continue
+                    if state_name in kv_cache_raw_tensors:
+                        continue
+
+                    state_spec = layer_kv_cache_spec[state_name]
+                    page_size_bytes = getattr(
+                        state_spec,
+                        "page_size_padded",
+                        getattr(state_spec, "page_size_bytes", None),
+                    )
+                    if page_size_bytes is None:
+                        page_size_bytes = (
+                            state_spec.block_size
+                            * state_spec.num_kv_heads
+                            * state_spec.head_size
+                            * get_dtype_size(state_spec.dtype)
+                        )
+
+                    state_tensor_size = int(kv_cache_config.num_blocks * page_size_bytes)
+                    kv_cache_raw_tensors[state_name] = torch.zeros(
+                        state_tensor_size,
+                        dtype=torch.int8,
+                        device=self.device,
+                    )
+
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
             for layer_name in group.layer_names:
                 if layer_name in self.runner_only_attn_layers:
                     continue
+
+                # DeepSeek-V4 DSA state-cache metadata layers are not allocated
+                # through kv_cache_raw_tensors. They are consumed separately by
+                # compressor/indexer logic and should not participate in this
+                # KV tensor allocation completeness check.
+                if (
+                    layer_name.endswith(".compressor.state_cache")
+                    and __import__("os").environ.get("DSV4_VLLM_SERVE_PATCH", "0") != "1"
+                ):
+                    continue
+
                 layer_names.add(layer_name)
-        assert layer_names == set(kv_cache_raw_tensors.keys()), "Some layers are not correctly initialized"
+        actual_layer_names = {
+            name for name in kv_cache_raw_tensors.keys()
+            if (
+                __import__("os").environ.get("DSV4_VLLM_SERVE_PATCH", "0") == "1"
+                or not name.endswith(".compressor.state_cache")
+            )
+        }
+
+        if layer_names != actual_layer_names:
+            missing = sorted(layer_names - actual_layer_names)
+            extra = sorted(actual_layer_names - layer_names)
+            print(
+                "[DSV4_KV_DEBUG] KV cache layer mismatch\\n"
+                f"expected={len(layer_names)} actual={len(actual_layer_names)} raw_actual={len(kv_cache_raw_tensors)}\\n"
+                f"missing_first_50={missing[:50]}\\n"
+                f"extra_first_50={extra[:50]}",
+                flush=True,
+            )
+        assert layer_names == actual_layer_names, (
+            "Some layers are not correctly initialized; "
+            f"expected={len(layer_names)} actual={len(actual_layer_names)} "
+            f"raw_actual={len(kv_cache_raw_tensors)} "
+            f"missing_first_50={sorted(layer_names - actual_layer_names)[:50]} "
+            f"extra_first_50={sorted(actual_layer_names - layer_names)[:50]}"
+        )
 
         return kv_cache_raw_tensors
 
@@ -3804,11 +3874,19 @@ class NPUModelRunner(GPUModelRunner):
                 if layer_name in self.runner_only_attn_layers:
                     continue
 
+                # DeepSeek-V4 DSA compressor/indexer state-cache metadata layers
+                # are not present in kv_cache_raw_tensors, so do not reshape them here.
+                if (
+                    layer_name.endswith(".compressor.state_cache")
+                    and __import__("os").environ.get("DSV4_VLLM_SERVE_PATCH", "0") != "1"
+                ):
+                    continue
+
                 current_kv_cache_spec = layer_kv_cache_spec[layer_name]
 
                 # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may
                 # encounter OOM issue
-                if self.use_compress and isinstance(current_kv_cache_spec, (MLAAttentionSpec, SlidingWindowMLASpec)):
+                if self.use_compress and isinstance(current_kv_cache_spec, AttentionSpec) and "cache_only_layers" not in layer_name and not isinstance(kv_cache_raw_tensors[layer_name], (tuple, list)):  # Moh_7596 compress-single
                     kv_tensor = kv_cache_raw_tensors[layer_name]
                     sum_page_size_bytes = kv_tensor.numel()
                     num_blocks = sum_page_size_bytes // current_kv_cache_spec.page_size_bytes

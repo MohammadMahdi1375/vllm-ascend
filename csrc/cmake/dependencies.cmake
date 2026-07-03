@@ -45,7 +45,7 @@ string(APPEND OPS_TRANSFORMER_CXX_FLAGS " -Wformat=2")
 string(APPEND OPS_TRANSFORMER_CXX_FLAGS " -fno-common")
 string(APPEND OPS_TRANSFORMER_CXX_FLAGS " -fPIC")
 if(NOT "${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
-#  string(APPEND OPS_TRANSFORMER_CXX_FLAGS " -Werror")   # TODO: add -Werror when fix all compile warnings
+#  string(APPEND OPS_TRANSFORMER_CXX_FLAGS " -Wno-error")   # TODO: add -Wno-error when fix all compile warnings
   string(APPEND OPS_TRANSFORMER_CXX_FLAGS " -Wformat-signedness")
   string(APPEND OPS_TRANSFORMER_CXX_FLAGS " -Wno-missing-include-dirs")
   string(APPEND OPS_TRANSFORMER_CXX_FLAGS " -Wno-write-strings")

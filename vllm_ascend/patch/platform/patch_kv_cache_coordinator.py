@@ -8,6 +8,7 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_coordinator import (
     HybridKVCacheCoordinator,
     KVCacheCoordinator,
+    KVCacheCoordinatorNoPrefixCache,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -22,6 +23,10 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCache
 from vllm_ascend.core.single_type_kv_cache_manager import get_manager_for_kv_cache_spec
 
 USE_MULTI_GROUPS_KV_CACHE = True
+
+# Keep original vLLM coordinator so the Ascend patch can safely fall back
+# for no-prefix-cache / single-effective-attention-group cases.
+_orig_get_kv_cache_coordinator = vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator
 
 
 class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
@@ -258,6 +263,62 @@ def get_kv_cache_coordinator(
     eagle_attn_layer_names: list[str] | None = None,
     metrics_collector: KVCacheMetricsCollector | None = None,
 ) -> KVCacheCoordinator:
+    # DFlash co-located training fallback.
+    #
+    # The local vLLM-Ascend patch unconditionally returned
+    # AscendHybridKVCacheCoordinator, but that coordinator asserts when the
+    # hybrid model collapses to one effective attention group:
+    #   "HybridKVCacheCoordinator requires at least two attention groups."
+    #
+    # For hidden-state extraction we do not need prefix-cache hits, so use the
+    # no-prefix coordinator for the single-effective-spec case.
+    unique_specs = []
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if not any(spec == seen for seen in unique_specs):
+            unique_specs.append(spec)
+
+    if not enable_caching:
+        return _orig_get_kv_cache_coordinator(
+            kv_cache_config,
+            max_model_len,
+            max_num_batched_tokens,
+            use_eagle,
+            enable_caching,
+            enable_kv_cache_events,
+            dcp_world_size,
+            pcp_world_size,
+            hash_block_size,
+            metrics_collector=metrics_collector,
+        )
+
+    if len(kv_cache_config.kv_cache_groups) <= 1:
+        return _orig_get_kv_cache_coordinator(
+            kv_cache_config,
+            max_model_len,
+            max_num_batched_tokens,
+            use_eagle,
+            enable_caching,
+            enable_kv_cache_events,
+            dcp_world_size,
+            pcp_world_size,
+            hash_block_size,
+            metrics_collector=metrics_collector,
+        )
+
+    if len(unique_specs) <= 1:
+        return KVCacheCoordinatorNoPrefixCache(
+            kv_cache_config,
+            max_model_len,
+            max_num_batched_tokens,
+            use_eagle,
+            enable_kv_cache_events,
+            dcp_world_size=dcp_world_size,
+            pcp_world_size=pcp_world_size,
+            hash_block_size=hash_block_size,
+            metrics_collector=metrics_collector,
+        )
+
     return AscendHybridKVCacheCoordinator(
         kv_cache_config,
         max_model_len,

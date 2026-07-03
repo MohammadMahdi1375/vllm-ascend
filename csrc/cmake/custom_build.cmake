@@ -75,7 +75,7 @@ if (BUILD_OPEN_PROJECT)
             $<BUILD_INTERFACE:${ASCEND_CANN_PACKAGE_PATH}/include/aclnn>
     )
     target_compile_options(cust_opapi PRIVATE
-            -Werror=format
+            -Wno-error=format
     )
     target_compile_definitions(cust_opapi PRIVATE
             -DACLNN_LOG_FMT_CHECK

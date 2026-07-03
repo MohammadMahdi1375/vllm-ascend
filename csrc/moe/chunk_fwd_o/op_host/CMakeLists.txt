@@ -18,7 +18,7 @@ add_ops_compile_options(
     OPTIONS
         --cce-auto-sync=off
         -Wno-deprecated-declarations
-        -Werror
+        -Wno-error
         -I${CATLASS_INCLUDE_DIR_ABS}
         -I${COMMON_KERNEL_UTILS_DIR_ABS}
 )

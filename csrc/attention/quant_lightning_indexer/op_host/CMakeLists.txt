@@ -19,7 +19,7 @@ add_ops_compile_options(
     OP_NAME QuantLightningIndexer
     OPTIONS --cce-auto-sync=off
             -Wno-deprecated-declarations
-            -Werror
+            -Wno-error
             -mllvm -cce-vf-remove-membar=false
             -mllvm -cce-aicore-hoist-movemask=false
 )

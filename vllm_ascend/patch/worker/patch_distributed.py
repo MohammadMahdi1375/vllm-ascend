@@ -143,7 +143,8 @@ class GroupCoordinatorPatch(GroupCoordinator):
 
                 # a group with `gloo` backend, to allow direct coordination between
                 # processes through the CPU.
-                cpu_group = torch.distributed.new_group(ranks, backend="gloo")
+                cpu_backend = "cpu:gloo,npu:hccl" if str(self.backend).lower() == "hccl" else "gloo"
+                cpu_group = torch.distributed.new_group(ranks, backend=cpu_backend)
                 if self.rank in ranks:
                     self.ranks = ranks
                     self.world_size = len(ranks)

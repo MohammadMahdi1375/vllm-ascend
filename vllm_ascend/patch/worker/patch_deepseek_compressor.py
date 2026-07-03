@@ -53,7 +53,7 @@ class AscendCompressorStateCache(CompressorStateCache):
         self.block_size = block_size
 
     def get_kv_cache_spec(self, vllm_config) -> KVCacheSpec:
-        page_size_padded = 16640 if self.state_dim == 2 * 256 and self.compress_ratio == 4 else 131072
+        page_size_padded = max(16640 if self.state_dim == 2 * 256 and self.compress_ratio == 4 else 131072, 2 * self.block_size * self.state_dim * 4)  # Moh_7596
         return SlidingWindowMLASpec(  # only has one vector instead of K + V
             block_size=self.block_size,
             num_kv_heads=1,

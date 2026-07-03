@@ -594,16 +594,17 @@ class DeepseekV4Attention(nn.Module):
         self.layer_idx = layer_idx
         config_layer_idx = extract_dsv4_layer_index(config, prefix)
         tp_size = get_tensor_model_parallel_world_size()
+        self._replicate_attn = (tp_size > config.o_groups) and not enable_dsa_cp()  # Moh_7596
         self.dim = config.hidden_size
         self.n_heads = config.num_attention_heads
-        self.n_local_heads = config.num_attention_heads // tp_size
+        self.n_local_heads = config.num_attention_heads if self._replicate_attn else config.num_attention_heads // tp_size  # Moh_7596
         self.q_lora_rank = config.q_lora_rank
         self.o_lora_rank = config.o_lora_rank
         self.head_dim = config.head_dim
         self.rope_head_dim = config.qk_rope_head_dim
         self.nope_head_dim = config.head_dim - config.qk_rope_head_dim
         self.n_groups = config.o_groups
-        self.n_local_groups = self.n_groups // tp_size
+        self.n_local_groups = self.n_groups if self._replicate_attn else self.n_groups // tp_size  # Moh_7596
         self.window_size = config.sliding_window
         self.eps = config.rms_norm_eps
         self.norm_eps = config.rms_norm_eps
@@ -621,7 +622,7 @@ class DeepseekV4Attention(nn.Module):
             return_bias=False,
         )
         self.q_norm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
-        wq_b_cls = ReplicatedLinear if self.enable_dsa_cp else ColumnParallelLinear
+        wq_b_cls = ReplicatedLinear if (self.enable_dsa_cp or self._replicate_attn) else ColumnParallelLinear  # Moh_7596
         self.wq_b = wq_b_cls(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -646,6 +647,7 @@ class DeepseekV4Attention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.wo_a",
+            disable_tp=self._replicate_attn,  # Moh_7596
             return_bias=False,
         )
         self.wo_b = RowParallelLinear(
@@ -654,6 +656,7 @@ class DeepseekV4Attention(nn.Module):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.wo_b",
+            disable_tp=self._replicate_attn,  # Moh_7596
             return_bias=False,
         )
         self.compress_ratio = get_dsv4_compress_ratio(config, config_layer_idx)
@@ -974,7 +977,11 @@ class DeepseekV4Model(nn.Module):
             llama_4_scaling = None
 
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b,s, c, h)
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        _aux = getattr(self, "aux_hidden_state_layers", ())  # Moh_7596
+        aux_hidden_states = []  # Moh_7596
+        for idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer), start=self.start_layer):  # Moh_7596
+            if idx in _aux:  # Moh_7596
+                aux_hidden_states.append((hidden_states if residual is None else hidden_states + residual).mean(dim=1))  # Moh_7596
             hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
@@ -1003,6 +1010,8 @@ class DeepseekV4Model(nn.Module):
             return IntermediateTensors({"hidden_states": hidden_states, "residual": residual})
 
         hidden_states = self.norm(hidden_states)
+        if len(aux_hidden_states) > 0:  # Moh_7596
+            return hidden_states, aux_hidden_states  # Moh_7596
         return hidden_states
 
 
@@ -1046,7 +1055,8 @@ class DeepseekV2MixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
-class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts, SupportsLoRA, SupportsEagle):
+from vllm.model_executor.models.interfaces import SupportsEagle3  # Moh_7596
+class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts, SupportsLoRA, SupportsEagle, SupportsEagle3):
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
@@ -1098,6 +1108,13 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def set_aux_hidden_state_layers(self, layers):  # Moh_7596
+        self.model.aux_hidden_state_layers = layers
+
+    def get_eagle3_aux_hidden_state_layers(self):  # Moh_7596
+        n = len(self.model.layers)
+        return (2, n // 2, n - 3)
 
     def forward(
         self,
@@ -1203,7 +1220,7 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
 
             if "sink" in name:
                 param = params_dict[name]
-                if enable_dsa_cp():
+                if enable_dsa_cp() or param.shape[0] == loaded_weight.shape[0]:  # Moh_7596
                     param.data.copy_(loaded_weight)
                 else:
                     # Handle attention sinks (distributed across ranks)

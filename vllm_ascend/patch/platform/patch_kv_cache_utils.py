@@ -140,13 +140,18 @@ def _get_kv_cache_groups_uniform_groups(
     for sm_spec in swa_mla_specs:
         sm_page_sizes = sm_spec.get_page_sizes()
         layers_per_size: dict[int, list[str]] = defaultdict(list)
-        assert max(sm_page_sizes) <= max(all_page_sizes)
+
+        # DeepSeek-V4-Flash can expose an SWA/SlidingWindow MLA page size that is
+        # larger than the page sizes in the full-MLA reference group. The original
+        # assertion crashes before serving starts. Extend the candidate set with
+        # the SWA sizes, so each SWA page size can map to itself when needed.
+        candidate_page_sizes = sorted(set(all_page_sizes) | set(sm_page_sizes))
 
         # Unify page size by padding layers' page_size to the nearest larger page_size.
         # Compute candidate (nearest larger page_size) for each unique page size.
         size_to_candidate: dict[int, int] = {}
         for ps in sm_page_sizes:
-            size_to_candidate[ps] = min(x for x in all_page_sizes if x >= ps)
+            size_to_candidate[ps] = min(x for x in candidate_page_sizes if x >= ps)
         # Pad and collect layer names per page size.
         for layer_name, layer_spec in sm_spec.kv_cache_specs.items():
             current_size = layer_spec.page_size_bytes

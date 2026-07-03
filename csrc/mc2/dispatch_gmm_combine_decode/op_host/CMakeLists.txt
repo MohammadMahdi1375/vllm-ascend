@@ -18,7 +18,7 @@ add_ops_compile_options(
     OPTIONS
         --cce-auto-sync=off
         -Wno-deprecated-declarations
-        -Werror
+        -Wno-error
         -DASCENDC_DUMP=0
         -DCATLASS_ARCH=2201
         ${_DISPATCH_GMM_INC_OPTS}

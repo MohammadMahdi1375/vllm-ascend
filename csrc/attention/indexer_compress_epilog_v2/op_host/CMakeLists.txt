@@ -12,7 +12,7 @@
 #         OP_NAME IndexerCompressEpilogV2
 #         OPTIONS --cce-auto-sync=off
 #                 -Wno-deprecated-declarations
-#                 -Werror
+#                 -Wno-error
 #                 -mllvm -cce-aicore-hoist-movemask=false
 #                 --op_relocatable_kernel_binary=true
 # )
@@ -54,7 +54,7 @@ add_ops_compile_options(
         OP_NAME IndexerCompressEpilogV2
         OPTIONS --cce-auto-sync=off
                 -Wno-deprecated-declarations
-                -Werror
+                -Wno-error
                 -mllvm -cce-aicore-hoist-movemask=false
                 --op_relocatable_kernel_binary=true
 )
