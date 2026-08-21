@@ -38,6 +38,7 @@ def _selector_walk_kernel_ascend(
     num_steps: tl.constexpr,
     top_k: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    SAMPLE_PROBABILISTIC: tl.constexpr,
     USE_FP64: tl.constexpr,
 ):
     """Ascend variant of upstream ``_selector_walk_kernel``.
@@ -53,6 +54,10 @@ def _selector_walk_kernel_ascend(
     req_state = tl.load(req_state_ptr + row * num_steps)
     valid = req_state >= 0
     temperature = tl.load(temperature_ptr + req_state, mask=valid, other=0.0)
+    # Match upstream DFlash2 semantics. If the draft is not producing a
+    # probabilistic proposal distribution, force the selector walk greedy.
+    if not SAMPLE_PROBABILISTIC:
+        temperature = 0.0
     seed = tl.load(seeds_ptr + req_state, mask=valid, other=0)
     previous = 0
     for step in range(num_steps):

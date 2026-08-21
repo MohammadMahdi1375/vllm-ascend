@@ -27,6 +27,12 @@ from .utils import input_guard, prepare_final_chunk_indices
 from .wy_fast import recompute_w_u_fwd
 
 
+_HAS_ASCEND_GDN_CHUNK_CUSTOM = (
+    hasattr(torch.ops._C_ascend, "chunk_gated_delta_rule_fwd_h")
+    and hasattr(torch.ops._C_ascend, "chunk_fwd_o")
+)
+
+
 def chunk_gated_delta_rule_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -112,21 +118,36 @@ def chunk_gated_delta_rule_fwd(
     else:
         cu_seqlens_kern, initial_state_kern = cu_seqlens_host, initial_state
         keep_meta = None
-    h, v_new, final_state = torch.ops._C_ascend.chunk_gated_delta_rule_fwd_h(
-        k_ascendc,
-        w_ascendc,
-        u_ascendc,
-        g=g_ascendc,
-        gk=None,
-        initial_state=initial_state_kern,
-        output_final_state=True,
-        chunk_size=64,
-        save_new_value=True,
-        cu_seqlens=cu_seqlens_kern,
-        chunk_indices=chunk_indices_chunk64_host,
-        use_exp2=False,
-        transpose_state_layout=False,
-    )
+    if _HAS_ASCEND_GDN_CHUNK_CUSTOM:
+        h, v_new, final_state = torch.ops._C_ascend.chunk_gated_delta_rule_fwd_h(
+            k_ascendc,
+            w_ascendc,
+            u_ascendc,
+            g=g_ascendc,
+            gk=None,
+            initial_state=initial_state_kern,
+            output_final_state=True,
+            chunk_size=64,
+            save_new_value=True,
+            cu_seqlens=cu_seqlens_kern,
+            chunk_indices=chunk_indices_chunk64_host,
+            use_exp2=False,
+            transpose_state_layout=False,
+        )
+    else:
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=initial_state,
+            output_final_state=True,
+            chunk_size=64,
+            save_new_value=True,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices_chunk64,
+            chunk_offsets=chunk_offsets_chunk64,
+        )
     if keep_meta is not None:
         # Scatter the compacted final_state back to the original [N, H, K, V]
         # layout the PCP state recursion expects; empty segments keep their
@@ -194,23 +215,40 @@ def chunk_gated_delta_rule_fwd(
             h = h.transpose(1, 2).contiguous()
             v_new = v_new.transpose(1, 2).contiguous()
 
-    o_ascendc = torch.ops._C_ascend.chunk_fwd_o(
-        q_ascendc,
-        k_ascendc,
-        v_new,
-        h,
-        scale,
-        g=g_ascendc,
-        g_gamma=None,
-        cu_seqlens=cu_seqlens_host,
-        chunk_indices=chunk_indices_chunk64_host,
-        chunk_size=64,
-        transpose_state_layout=False,
-    )
+    if _HAS_ASCEND_GDN_CHUNK_CUSTOM:
+        o_ascendc = torch.ops._C_ascend.chunk_fwd_o(
+            q_ascendc,
+            k_ascendc,
+            v_new,
+            h,
+            scale,
+            g=g_ascendc,
+            g_gamma=None,
+            cu_seqlens=cu_seqlens_host,
+            chunk_indices=chunk_indices_chunk64_host,
+            chunk_size=64,
+            transpose_state_layout=False,
+        )
 
-    o = o_ascendc.to(torch.bfloat16).transpose(1, 2).contiguous()
-    v_new = v_new.to(torch.bfloat16).transpose(1, 2).contiguous()
-    h = h.to(torch.bfloat16).transpose(1, 2).contiguous()
+        o = o_ascendc.to(torch.bfloat16).transpose(1, 2).contiguous()
+        v_new = v_new.to(torch.bfloat16).transpose(1, 2).contiguous()
+        h = h.to(torch.bfloat16).transpose(1, 2).contiguous()
+    else:
+        o = chunk_fwd_o(
+            q=q,
+            k=k,
+            v=v_new,
+            h=h,
+            g=g,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_size=64,
+            chunk_offsets=chunk_offsets_chunk64,
+        )
+
+        o = o.to(torch.bfloat16)
+        v_new = v_new.to(torch.bfloat16)
+        h = h.to(torch.bfloat16)
 
     if SUPPRESS_LEVEL < 3:
         return g, o, A, final_state, None, None, None

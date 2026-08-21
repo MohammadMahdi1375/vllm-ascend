@@ -104,7 +104,9 @@ class AscendGemmaRMSNorm(GemmaRMSNorm):
                 x, _, residual = torch_npu.npu_add_rms_norm(x, residual, 1.0 + self.weight, self.variance_epsilon)
             return x, residual
 
-        x = DeviceOperator.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
+        x, _ = torch_npu.npu_rms_norm(
+            x, 1.0 + self.weight, self.variance_epsilon
+        )
 
         return x
 
