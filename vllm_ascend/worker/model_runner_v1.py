@@ -1914,6 +1914,16 @@ class NPUModelRunner(GPUModelRunner):
         elif self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model():
             common_attn_metadata = spec_decode_common_attn_metadata
             sampled_token_ids = valid_sampled_token_ids
+            if getattr(self.drafter, "retrace_enabled", False):
+                if scheduler_output.num_spec_tokens_to_schedule != self.drafter.retrace_cache.k:
+                    raise ValueError("ReTrace requires a fixed scheduled proposal count")
+                self.drafter.retrace_begin_step(
+                    self.input_batch.req_ids.copy(),
+                    hidden_states[:num_scheduled_tokens],
+                    self._get_positions(num_scheduled_tokens),
+                    spec_decode_metadata,
+                    sampled_token_ids,
+                )
 
             if self.vllm_config.speculative_config.disable_padded_drafter_batch:
                 # When padded-batch is disabled, the sampled_token_ids should be
@@ -2018,6 +2028,8 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens=num_scheduled_tokens,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
+            if getattr(self.drafter, "retrace_enabled", False):
+                self.drafter.retrace_finish_step(draft_token_ids)
             if hasattr(self.drafter, "take_last_draft_probs"):
                 draft_probs = self.drafter.take_last_draft_probs()
                 if draft_probs is not None:

@@ -1292,6 +1292,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         model_input_ids = self.input_ids[:num_input_tokens]
         model_positions = self._get_positions(num_input_tokens)
         model_kwargs = {"input_ids": model_input_ids, "positions": model_positions, "inputs_embeds": inputs_embeds}
+        if getattr(self, "retrace_enabled", False):
+            model_kwargs.update(self.retrace_model_kwargs(model_positions))
 
         if self.method in ("dflash", "dspark"):
             self.build_model_inputs_first_pass(num_input_tokens, self._context_slot_mapping_buffers)
@@ -1347,6 +1349,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             )
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
+        if getattr(self, "retrace_enabled", False):
+            self.retrace_capture(last_hidden_states, token_indices_to_sample)
 
         draft_probs_step0: torch.Tensor | None = None
         if getattr(self, "use_dflash2_selector", False):
@@ -1425,10 +1429,62 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 draft_token_ids = self._dspark_draft_buffer[:num_blk]
                 draft_token_ids[:, 0].copy_(self._dspark_seed_buffer[:num_blk])
                 dspark_probs_list: list[torch.Tensor] = []
+
+                # The checkpoint records which Speculators MarkovHead
+                # implementation was used during training.
+                markov_head_type = getattr(
+                    self.model.config,
+                    "markov_head_type",
+                    "vanilla",
+                )
+
+                # Speculators RNN/gated heads consume the parallel draft
+                # backbone hidden state for each speculative position.
+                #
+                # sample_hidden_states:
+                #   [num_blk * K, hidden]
+                #
+                # Recover:
+                #   [num_blk, K, hidden]
+                dspark_hidden_states = sample_hidden_states[
+                    : num_blk * self.num_speculative_tokens
+                ].reshape(
+                    num_blk,
+                    self.num_speculative_tokens,
+                    -1,
+                )
+
+                # Speculators resets recurrent state to zero at the
+                # beginning of every draft block. markov_step() creates
+                # the zero tensor when state is None on idx == 0.
+                markov_state = None
+
                 for idx in range(self.num_speculative_tokens):
-                    markov_emb = self.model.markov_embed(draft_token_ids[:, idx])
-                    logits_bias = self.model.markov_bias(markov_emb)
+                    if markov_head_type == "vanilla":
+                        # Preserve the original vanilla DSpark inference
+                        # path exactly.
+                        markov_emb = self.model.markov_embed(
+                            draft_token_ids[:, idx]
+                        )
+                        logits_bias = self.model.markov_bias(
+                            markov_emb
+                        )
+                    else:
+                        # gated/rnn:
+                        # use the exact sequential-head computation that
+                        # corresponds to Speculators training.
+                        (
+                            logits_bias,
+                            _markov_prev_emb,
+                            markov_state,
+                        ) = self.model.markov_step(
+                            token_ids=draft_token_ids[:, idx],
+                            hidden_states=dspark_hidden_states[:, idx],
+                            state=markov_state,
+                        )
+
                     logits[:, idx].add_(logits_bias)
+
                     if use_probabilistic:
                         # Use probabilistic sampling instead of argmax.
                         # logits[:, idx] is [num_blk, V], matching

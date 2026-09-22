@@ -22,7 +22,11 @@ from vllm_ascend.spec_decode.dflash2_proposer import AscendDflash2Proposer, is_d
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
 from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
+from vllm_ascend.spec_decode.retrace_dspark_proposer import (
+    AscendReTraceDSparkProposer, is_retrace_dspark_draft,
+)
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
+from vllm_ascend.spec_decode.retrace_proposer import AscendReTraceProposer, is_retrace_draft
 from vllm_ascend.spec_decode.extract_hidden_states_proposer import (
     AscendExtractHiddenStatesProposer,
 )
@@ -43,6 +47,8 @@ def get_spec_decode_method(method, vllm_config, device, runner):
     elif method == "medusa":
         return AscendMedusaProposer(vllm_config, device)
     elif method == "dspark":
+        if is_retrace_dspark_draft(vllm_config.speculative_config):
+            return AscendReTraceDSparkProposer(vllm_config, device, runner)
         return AscendDSparkProposer(vllm_config, device, runner)
     elif method in ("eagle", "eagle3", "mtp"):
         speculative_config = vllm_config.speculative_config
@@ -50,6 +56,8 @@ def get_spec_decode_method(method, vllm_config, device, runner):
             return AscendStep3p5MTPProposer(vllm_config, device, runner)
         return AscendEagleProposer(vllm_config, device, runner)
     elif method == "dflash":
+        if is_retrace_draft(vllm_config.speculative_config):
+            return AscendReTraceProposer(vllm_config, device, runner)
         if is_dflash2_draft(vllm_config.speculative_config):
             return AscendDflash2Proposer(vllm_config, device, runner)
         return AscendDflashProposer(vllm_config, device, runner)
