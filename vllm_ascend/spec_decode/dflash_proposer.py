@@ -97,6 +97,15 @@ class AscendDflashProposer(AscendEagleProposer):
                 device=device,
             )
 
+    def _dflash_attention_is_causal(self):
+        resolver = getattr(self.model, "get_draft_attn_causal", None)
+        if resolver is None:
+            return False
+        flags = resolver()
+        if not flags or any(flag != flags[0] for flag in flags):
+            raise ValueError("Ascend v1 DFlash needs uniform attention causality across draft layers")
+        return bool(flags[0])
+
     def set_inputs_first_pass(
         self,
         target_token_ids: torch.Tensor,
@@ -180,7 +189,7 @@ class AscendDflashProposer(AscendEagleProposer):
         cad.max_query_len = num_query_per_req
         cad.max_seq_len = cad.max_seq_len + num_query_per_req
         cad.slot_mapping = query_slot_mapping
-        cad.causal = False
+        cad.causal = self._dflash_attention_is_causal()
         cad.attn_mask = None
         cad.attn_state = AscendAttentionState.ChunkedPrefill
 
@@ -229,7 +238,7 @@ class AscendDflashProposer(AscendEagleProposer):
                 max_seq_len=0,
                 slot_mapping=self._slot_mapping_buffer[:num_query_total],
                 attn_state=AscendAttentionState.ChunkedPrefill,
-                causal=False,
+                causal=self._dflash_attention_is_causal(),
                 is_prefilling=torch.zeros(num_reqs, dtype=torch.bool),
                 block_table_tensor=self.runner.input_batch.block_table[self.kv_cache_gid].get_device_tensor()[
                     :num_reqs
@@ -241,7 +250,8 @@ class AscendDflashProposer(AscendEagleProposer):
                 AscendAttentionState.ChunkedPrefill,
             )
 
-            attn_metadata_dflash.attn_mask = None
+            if not attn_metadata_dflash.causal:
+                attn_metadata_dflash.attn_mask = None
             attn_metadata_dflash.attn_state = AscendAttentionState.ChunkedPrefill
 
             per_layer_attn_metadata = dict()

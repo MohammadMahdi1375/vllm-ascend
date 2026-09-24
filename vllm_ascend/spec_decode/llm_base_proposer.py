@@ -1237,6 +1237,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 )
             return logits.argmax(dim=-1), None
 
+        # RETRACE_DFLASH_MATCHED_SAMPLING v1
+        import os
+        if self.method == "dflash" and os.environ.get("RETRACE_DFLASH_MATCHED_SAMPLING") == "1":
+            if not self._enable_probabilistic_draft_probs:
+                raise ValueError("Matched DFlash sampling requires draft_sample_method=probabilistic")
+            from vllm_ascend.spec_decode.retrace_dflash_sampling import sample_dflash
+            return sample_dflash(logits, sampling_metadata, self.num_speculative_tokens)
+
         return super()._sample_from_logits(logits, sampling_metadata)
 
     def compute_draft_token_ids(
