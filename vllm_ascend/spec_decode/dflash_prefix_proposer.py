@@ -1,10 +1,11 @@
 """Ascend v1 correctness implementation for the DFlash prefix selector."""
 
+import os
 import torch
 from vllm.logger import init_logger
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 
-logger = init_logger(__name__)
+logger = init_logger('vllm.dflash_prefix')
 
 
 def is_dflash_prefix_draft(speculative_config):
@@ -42,6 +43,15 @@ class AscendDflashPrefixProposer(AscendDflashProposer):
         # This existing v1 dispatch flag calls compute_draft_token_ids before
         # ordinary argmax/reduce-sample paths. Its historical name is DFlash2,
         # but we supply our own selector through the overridden method below.
+        # Optional checkpoint-compatible prefix inference cache (v1).
+        self._prefix_inference_mode = os.environ.get("DFLASH_PREFIX_INFERENCE", "reference")
+        if self._prefix_inference_mode not in {"reference", "validate", "fast"}:
+            raise ValueError("DFLASH_PREFIX_INFERENCE must be reference, validate, or fast")
+        if self._prefix_inference_mode != "reference" and (
+                cfg.get("prefix_selector_kind") != "local_prefix_v2"
+                or self._prefix_walk_backend != "torch"):
+            raise ValueError("Cached inference requires local_prefix_v2 with the torch backend")
+        self._prefix_inference_runtime = None
         self.use_dflash2_selector = True
         self._prefix_anchor_indices = torch.arange(
             self.max_batch_size, device=device, dtype=torch.long
@@ -73,6 +83,15 @@ class AscendDflashPrefixProposer(AscendDflashProposer):
         unary = unary.reshape(n, steps, self.prefix_top_k)
         anchors = self.input_ids[self._prefix_anchor_indices[:n]]
         head = self.model.model.prefix_head
+        if self._prefix_inference_mode != "reference":
+            if self._prefix_inference_runtime is None:
+                from speculators.models.dflash_prefix.inference_v2 import PrefixInferenceRuntime
+                self._prefix_inference_runtime = PrefixInferenceRuntime(head, logger)
+            selected = self._prefix_inference_runtime.select(
+                hidden, candidates, unary, anchors,
+                embedding_weight=self.model.model.embed_tokens.weight,
+            )
+            return selected.reshape(-1), None
         prepare = getattr(self.model, "prepare_prefix_tables", None)
         if prepare is None:
             if getattr(head, "requires_token_embeddings", False):
