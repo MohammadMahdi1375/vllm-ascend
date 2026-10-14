@@ -35,9 +35,9 @@ class AscendDflashPrefixProposer(AscendDflashProposer):
         self._prefix_walk_backend = cfg.get("prefix_walk_backend", "torch")
         if self._prefix_walk_backend not in {"torch", "triton", "auto"}:
             raise ValueError("prefix_walk_backend must be torch, triton, or auto")
-        if (cfg.get("prefix_selector_kind") == "local_prefix_v2"
+        if (cfg.get("prefix_selector_kind") in {"local_prefix_v2", "compiled_prefix_v3"}
                 and self._prefix_walk_backend != "torch"):
-            raise ValueError("local_prefix_v2 requires prefix_walk_backend=torch")
+            raise ValueError("Attention prefix selectors require prefix_walk_backend=torch")
         self._prefix_fused_walk = None
         self._prefix_walk_checked = self._prefix_walk_backend == "torch"
         # This existing v1 dispatch flag calls compute_draft_token_ids before
@@ -48,14 +48,28 @@ class AscendDflashPrefixProposer(AscendDflashProposer):
         if self._prefix_inference_mode not in {"reference", "validate", "fast"}:
             raise ValueError("DFLASH_PREFIX_INFERENCE must be reference, validate, or fast")
         if self._prefix_inference_mode != "reference" and (
-                cfg.get("prefix_selector_kind") != "local_prefix_v2"
+                cfg.get("prefix_selector_kind") not in {"local_prefix_v2", "compiled_prefix_v3"}
                 or self._prefix_walk_backend != "torch"):
-            raise ValueError("Cached inference requires local_prefix_v2 with the torch backend")
+            raise ValueError("Optimized inference requires an attention prefix selector with the torch backend")
+        self._compiled_prefix = cfg.get("prefix_selector_kind") == "compiled_prefix_v3"
         self._prefix_inference_runtime = None
+        self._prefix_in_dummy_run = False
+        self._prefix_dummy_logged = False
         self.use_dflash2_selector = True
         self._prefix_anchor_indices = torch.arange(
             self.max_batch_size, device=device, dtype=torch.long
         ) * (1 + self.num_speculative_tokens)
+
+    def dummy_run(self, *args, **kwargs):
+        # Target graph startup also invokes the eager drafter on its startup
+        # stream. Keep the selector runtime unbound until a real request arrives
+        # on the serving stream. Preserve this scope even if warmup raises.
+        previous = self._prefix_in_dummy_run
+        self._prefix_in_dummy_run = True
+        try:
+            return super().dummy_run(*args, **kwargs)
+        finally:
+            self._prefix_in_dummy_run = previous
 
     def _maybe_share_lm_head(self, model):
         if getattr(self.model, "draft_id_to_target_id", None) is not None:
@@ -83,10 +97,33 @@ class AscendDflashPrefixProposer(AscendDflashProposer):
         unary = unary.reshape(n, steps, self.prefix_top_k)
         anchors = self.input_ids[self._prefix_anchor_indices[:n]]
         head = self.model.model.prefix_head
-        if self._prefix_inference_mode != "reference":
+        if self._prefix_in_dummy_run and (
+            self._compiled_prefix or self._prefix_inference_mode != "reference"
+        ):
+            # Exercise the real head and allocation shapes during dummy warmup,
+            # but do not capture/replay graphs or count dummy parity checks.
+            # Real requests still use the runtime below, including its unchanged
+            # caller-stream guard and strict score/token comparisons.
+            tables = head.prepare_tables(
+                hidden, candidates, unary, anchors,
+                embedding_weight=self.model.model.embed_tokens.weight,
+            )
+            selected = head.greedy_walk(tables)
+            if not self._prefix_dummy_logged:
+                logger.info(
+                    "PREFIX_SELECTOR_DUMMY_EAGER graph_capture=deferred_until_request; "
+                    "startup tokens discarded; production parity checks unchanged"
+                )
+                self._prefix_dummy_logged = True
+            return selected.reshape(-1), None
+        if self._compiled_prefix or self._prefix_inference_mode != "reference":
             if self._prefix_inference_runtime is None:
-                from speculators.models.dflash_prefix.inference_v2 import PrefixInferenceRuntime
-                self._prefix_inference_runtime = PrefixInferenceRuntime(head, logger)
+                if self._compiled_prefix:
+                    from speculators.models.dflash_prefix.compiled_inference import CompiledPrefixInferenceRuntime
+                    self._prefix_inference_runtime = CompiledPrefixInferenceRuntime(head, logger)
+                else:
+                    from speculators.models.dflash_prefix.inference_v2 import PrefixInferenceRuntime
+                    self._prefix_inference_runtime = PrefixInferenceRuntime(head, logger)
             selected = self._prefix_inference_runtime.select(
                 hidden, candidates, unary, anchors,
                 embedding_weight=self.model.model.embed_tokens.weight,
