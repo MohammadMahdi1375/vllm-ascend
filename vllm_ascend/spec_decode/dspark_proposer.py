@@ -17,13 +17,16 @@ from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
 from vllm_ascend.attention.utils import enable_pcp
 from vllm_ascend.ops.triton.spec_decode.utils import copy_and_expand_dflash_and_dspark_inputs_kernel
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer, _compute_num_programs
+from vllm.logger import logger
+from vllm_ascend import envs
+from vllm_ascend.spec_decode.dspark_head_graph import DSparkHeadGraph
 from vllm_ascend.spec_decode.utils import DynamicSpecScheduler
 
 
 class AscendDSparkProposer(AscendDflashProposer):
     """DSpark block proposer.
 
-    DSpark uses vLLM's ``mtp`` method in user config, but its execution shape is
+    DSpark uses vLLM's ``dspark`` method in user config; its execution shape is
     closer to DFlash: target hidden states prepopulate draft K/V, then one
     anchor-first query block emits all speculative tokens.
     """
@@ -71,6 +74,21 @@ class AscendDSparkProposer(AscendDflashProposer):
             )
         # DSpark runs eager only (Ascend cudagraph unsupported on this path).
         self.use_cuda_graph = False
+        # Separate Markov graph; never enable unsupported draft-attention capture.
+        head_mode = envs.VLLM_ASCEND_DSPARK_HEAD_GRAPH
+        if head_mode not in {"off", "fast", "validate"}:
+            raise ValueError("VLLM_ASCEND_DSPARK_HEAD_GRAPH must be off, fast, or validate")
+        self._dspark_in_dummy_run = False
+        self._dspark_head_runtime = None
+        if head_mode != "off":
+            parallel = self.vllm_config.parallel_config
+            if (parallel.tensor_parallel_size != 1 or parallel.data_parallel_size != 1
+                    or self.max_batch_size != 1 or self.dynamic_spec is not None
+                    or self.speculative_config.draft_sample_method != "greedy"):
+                raise ValueError("DSpark head graph requires TP=DP=max_num_seqs=1, greedy, adaptive verification off")
+            self._dspark_head_runtime = DSparkHeadGraph(head_mode, logger)
+        logger.info("DSPARK_EXECUTION draft_backbone=eager head_graph=%s", head_mode)
+
         # Max query tokens depend on whether sampling from anchor or not.
         self.max_query_tokens = self.max_batch_size * self.num_query_per_req
         # Position ids for the draft query block [max_query_tokens].
@@ -357,7 +375,7 @@ class AscendDSparkProposer(AscendDflashProposer):
         return num_query_total, token_indices_to_sample, cad, long_seq_args
 
     @torch.inference_mode()
-    def dummy_run(
+    def _dspark_dummy_run_impl(
         self,
         num_tokens: int,
         num_reqs: int = 0,
@@ -420,3 +438,12 @@ class AscendDSparkProposer(AscendDflashProposer):
                     multi_steps_attn_metadata=[],
                     num_tokens=num_input_tokens,
                 )
+
+
+    @torch.inference_mode()
+    def dummy_run(self, *args, **kwargs):
+        self._dspark_in_dummy_run = True
+        try:
+            return self._dspark_dummy_run_impl(*args, **kwargs)
+        finally:
+            self._dspark_in_dummy_run = False

@@ -36,6 +36,10 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
 
 
 env_variables: dict[str, Callable[[], Any]] = {
+    # DSpark Markov-loop graph. Default off; valid off/validate/fast.
+    # Not sensitive. validate checks every block; fast checks the first 32.
+    # Single-request Qwen3, TP=DP=1, full-vocabulary greedy proposals only.
+    "VLLM_ASCEND_DSPARK_HEAD_GRAPH": lambda: os.getenv("VLLM_ASCEND_DSPARK_HEAD_GRAPH", "off"),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
     # means all number of CPU cores will be used.
@@ -101,3 +105,4 @@ def __getattr__(name: str):
 
 def __dir__():
     return list(env_variables.keys())
+

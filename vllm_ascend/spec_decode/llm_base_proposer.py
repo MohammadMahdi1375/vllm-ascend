@@ -1434,79 +1434,90 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     raw_logits = raw_logits[:num_indices]
                 logits = raw_logits.view(-1, self.num_speculative_tokens, raw_logits.shape[-1])
                 num_blk = logits.shape[0]
-                draft_token_ids = self._dspark_draft_buffer[:num_blk]
-                draft_token_ids[:, 0].copy_(self._dspark_seed_buffer[:num_blk])
-                dspark_probs_list: list[torch.Tensor] = []
+                runtime = getattr(self, "_dspark_head_runtime", None)
+                if runtime is not None and not getattr(self, "_dspark_in_dummy_run", False):
+                    if use_probabilistic or dspark_has_vocab_mapping or lmhead_tp_enable():
+                        raise ValueError("DSpark head graph requires full-vocabulary greedy sampling and TP=1")
+                    draft_token_ids = runtime.select(
+                        self.model, logits,
+                        sample_hidden_states[:num_blk * self.num_speculative_tokens].reshape(
+                            num_blk, self.num_speculative_tokens, -1),
+                        self._dspark_seed_buffer[:num_blk],
+                    )
+                else:
+                    draft_token_ids = self._dspark_draft_buffer[:num_blk]
+                    draft_token_ids[:, 0].copy_(self._dspark_seed_buffer[:num_blk])
+                    dspark_probs_list: list[torch.Tensor] = []
 
-                # The checkpoint records which Speculators MarkovHead
-                # implementation was used during training.
-                markov_head_type = getattr(
-                    self.model.config,
-                    "markov_head_type",
-                    "vanilla",
-                )
+                    # The checkpoint records which Speculators MarkovHead
+                    # implementation was used during training.
+                    markov_head_type = getattr(
+                        self.model.config,
+                        "markov_head_type",
+                        "vanilla",
+                    )
 
-                # Speculators RNN/gated heads consume the parallel draft
-                # backbone hidden state for each speculative position.
-                #
-                # sample_hidden_states:
-                #   [num_blk * K, hidden]
-                #
-                # Recover:
-                #   [num_blk, K, hidden]
-                dspark_hidden_states = sample_hidden_states[
-                    : num_blk * self.num_speculative_tokens
-                ].reshape(
-                    num_blk,
-                    self.num_speculative_tokens,
-                    -1,
-                )
+                    # Speculators RNN/gated heads consume the parallel draft
+                    # backbone hidden state for each speculative position.
+                    #
+                    # sample_hidden_states:
+                    #   [num_blk * K, hidden]
+                    #
+                    # Recover:
+                    #   [num_blk, K, hidden]
+                    dspark_hidden_states = sample_hidden_states[
+                        : num_blk * self.num_speculative_tokens
+                    ].reshape(
+                        num_blk,
+                        self.num_speculative_tokens,
+                        -1,
+                    )
 
-                # Speculators resets recurrent state to zero at the
-                # beginning of every draft block. markov_step() creates
-                # the zero tensor when state is None on idx == 0.
-                markov_state = None
+                    # Speculators resets recurrent state to zero at the
+                    # beginning of every draft block. markov_step() creates
+                    # the zero tensor when state is None on idx == 0.
+                    markov_state = None
 
-                for idx in range(self.num_speculative_tokens):
-                    if markov_head_type == "vanilla":
-                        # Preserve the original vanilla DSpark inference
-                        # path exactly.
-                        markov_emb = self.model.markov_embed(
-                            draft_token_ids[:, idx]
-                        )
-                        logits_bias = self.model.markov_bias(
-                            markov_emb
-                        )
-                    else:
-                        # gated/rnn:
-                        # use the exact sequential-head computation that
-                        # corresponds to Speculators training.
-                        (
-                            logits_bias,
-                            _markov_prev_emb,
-                            markov_state,
-                        ) = self.model.markov_step(
-                            token_ids=draft_token_ids[:, idx],
-                            hidden_states=dspark_hidden_states[:, idx],
-                            state=markov_state,
-                        )
+                    for idx in range(self.num_speculative_tokens):
+                        if markov_head_type == "vanilla":
+                            # Preserve the original vanilla DSpark inference
+                            # path exactly.
+                            markov_emb = self.model.markov_embed(
+                                draft_token_ids[:, idx]
+                            )
+                            logits_bias = self.model.markov_bias(
+                                markov_emb
+                            )
+                        else:
+                            # gated/rnn:
+                            # use the exact sequential-head computation that
+                            # corresponds to Speculators training.
+                            (
+                                logits_bias,
+                                _markov_prev_emb,
+                                markov_state,
+                            ) = self.model.markov_step(
+                                token_ids=draft_token_ids[:, idx],
+                                hidden_states=dspark_hidden_states[:, idx],
+                                state=markov_state,
+                            )
 
-                    logits[:, idx].add_(logits_bias)
+                        logits[:, idx].add_(logits_bias)
 
-                    if use_probabilistic:
-                        # Use probabilistic sampling instead of argmax.
-                        # logits[:, idx] is [num_blk, V], matching
-                        # batch_size for per-request temperature.
-                        token_ids, probs = self._sample_draft_from_logits(logits[:, idx], sampling_metadata)
-                        draft_token_ids[:, idx + 1].copy_(token_ids)
-                        if probs is not None:
-                            dspark_probs_list.append(probs)
-                    else:
-                        draft_token_ids[:, idx + 1].copy_(logits[:, idx].argmax(dim=-1))
-                if use_probabilistic and dspark_probs_list:
-                    # Stack [K x [num_blk, V]] -> [num_blk, K, V] ->
-                    # [num_blk * K, V] to match early_exit view logic.
-                    draft_probs_step0 = torch.stack(dspark_probs_list, dim=1).view(-1, logits.shape[-1]).contiguous()
+                        if use_probabilistic:
+                            # Use probabilistic sampling instead of argmax.
+                            # logits[:, idx] is [num_blk, V], matching
+                            # batch_size for per-request temperature.
+                            token_ids, probs = self._sample_draft_from_logits(logits[:, idx], sampling_metadata)
+                            draft_token_ids[:, idx + 1].copy_(token_ids)
+                            if probs is not None:
+                                dspark_probs_list.append(probs)
+                        else:
+                            draft_token_ids[:, idx + 1].copy_(logits[:, idx].argmax(dim=-1))
+                    if use_probabilistic and dspark_probs_list:
+                        # Stack [K x [num_blk, V]] -> [num_blk, K, V] ->
+                        # [num_blk * K, V] to match early_exit view logic.
+                        draft_probs_step0 = torch.stack(dspark_probs_list, dim=1).view(-1, logits.shape[-1]).contiguous()
 
                 # Dynamic verify-length path, implemented in DynamicSpecScheduler
                 # Only the dspark method is handled here since it relies on
@@ -2601,3 +2612,4 @@ def _split_draft_outputs(ret):
     if len(ret) == 2:
         return ret[0], ret[1]
     return ret[0], ret[0]
+
